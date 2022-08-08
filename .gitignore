@@ -26,5 +26,5 @@ vignettes/*.pdf
 *.knit.md
 # R Environment Variables
 .Renviron
-# .csv files seem to be causing issues
-*.csv
+# .csv files seem to be causing issues - COMMENTED OUT TO CHECK
+#*.csv
