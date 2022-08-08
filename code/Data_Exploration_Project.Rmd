@@ -1,0 +1,240 @@
+---
+title: "Data Exploration Project"
+author: "Jonathan Burns"
+date: "2022-08-08"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+library(tidyverse)
+library(purrr)
+library(lubridate)
+library(fixest)
+```
+
+## Gather and manipulate data
+### Read trend files from project directory
+
+```{r}
+files <- list.files("data", full.names=TRUE, pattern = "^trends_up_to_")
+gtrends_df <- map_df(files, read_csv)
+```
+
+### Clean and aggregate data
+
+Cleans date data, assigning first of week to "date" column, and first of month to
+"month" column. Then calculates standardized "index" by school and keyword as
+"stand_index", and drop NA values.
+Lastly, summarizes by keyword-month level and saves as new dataframe "mth_agg".
+
+```{r}
+gtrends_df <- gtrends_df %>%
+  mutate(mow_transf = str_sub(gtrends_df$monthorweek, 1, 10)) %>%
+  mutate(date = ymd(mow_transf)) %>%
+  mutate(month = floor_date(date, unit = 'month'))
+
+gtrends_df <- gtrends_df %>%
+  group_by(schname, keyword) %>%
+  mutate(stand_index = (index - mean(index)/sd(index))) %>%
+  filter(!is.na(stand_index))
+
+mth_agg <- gtrends_df %>%
+  group_by(schname, month) %>%
+  summarize(stand_index)
+```
+### Read in scorecard data
+
+```{r}
+scorecard <- read_csv("data/Most+Recent+Cohorts+(Scorecard+Elements).csv")
+id_to_name <- read_csv("data/id_name_link.csv")
+```
+
+### Merge scorecard data into main data frame
+
+First, remove duplicate schools from id_to_name data frame. Then, join data frames.
+
+```{r}
+id_to_name <- id_to_name %>%
+  group_by(schname) %>%
+  mutate(n = n()) %>%
+  filter(n == 1)
+
+full_trends_df <- inner_join(gtrends_df, id_to_name)
+
+full_trends_df <- inner_join(full_trends_df, scorecard, by = c("unitid" = "UNITID"))
+
+month_trends_df <- inner_join(mth_agg, id_to_name)
+
+month_trends_df <- inner_join(month_trends_df, scorecard, by = c("unitid" = "UNITID"))
+```
+## Research question
+
+The College Scorecard was released at the start of September 2015. Among colleges that predominantly grant bachelor’s degrees, did the release of the Scorecard shift student interest to high-earnings colleges relative to low-earnings ones (as proxied by Google searches for keywords associated with those colleges)?
+
+### Analysis of data
+
+We may want to consider the monthly data - weekly data (especially for smaller schools) can be
+volatile, so monthly data should help smooth trends out. However, it's a bit early
+to decide on that, so we'll duplicate the following steps on both. Additionally,
+we've completely abandoned the "keyword" field because we're interested in the
+association with the school - not the specific syntax in the Google searches.
+
+Based on the research question, it's clear some more data manipulation is necessary.
+
+First, filter out rows without income data, and convert remaining to numeric values.
+
+```{r}
+full_trends_df <- full_trends_df[!is.na(as.numeric(full_trends_df$`md_earn_wne_p10-REPORTED-EARNINGS`)), ]
+
+full_trends_df <- full_trends_df %>%
+  mutate(md_earn_10 = as.numeric(`md_earn_wne_p10-REPORTED-EARNINGS`))
+
+month_trends_df <- month_trends_df[!is.na(as.numeric(month_trends_df$`md_earn_wne_p10-REPORTED-EARNINGS`)), ]
+
+month_trends_df <- month_trends_df %>%
+  mutate(md_earn_10 = as.numeric(`md_earn_wne_p10-REPORTED-EARNINGS`))
+```
+
+Using the scorecard data, we will assign 3 categories for colleges, based on the mean
+earnings of students 10 years after entry:
+
+low: less than mean(md_earn_wne_p10) - 0.67 * sd(md_earn_wne_p10)
+med: within mean(md_earn_wne_p10) +/- 0.67 * sd(md_earn_wn_p10)
+high: greater than mean(md_earn_wne_p10) + 0.67 * sd(md_earn_wn_p10)
+
+This filter approximates the bottom and top quartiles of the population, but uses
+the standard deviation to find these quartiles to help smooth out any idiosyncrasies
+in the sample data.
+
+Finally, we'll filter to high/low to focus on our test data.
+
+```{r}
+low <- mean(full_trends_df$md_earn_10) - 0.67 * sd(full_trends_df$md_earn_10)
+high <- mean(full_trends_df$md_earn_10) + 0.67 * sd(full_trends_df$md_earn_10)
+
+full_trends_df <- full_trends_df %>%
+  mutate(earnings_bracket = case_when(md_earn_10 < low ~ "low",
+                                      md_earn_10 > high ~ "high",
+                                      TRUE ~ "med"))
+
+full_trends_df %>%
+  group_by(earnings_bracket) %>%
+  distinct(schname) %>%
+  count()
+
+full_hi_lo_df <- filter(full_trends_df, earnings_bracket != "med")
+
+# monthly starts here
+
+low <- mean(month_trends_df$md_earn_10) - 0.67 * sd(month_trends_df$md_earn_10)
+high <- mean(month_trends_df$md_earn_10) + 0.67 * sd(month_trends_df$md_earn_10)
+
+month_trends_df <- month_trends_df %>%
+  mutate(earnings_bracket = case_when(md_earn_10 < low ~ "low",
+                                      md_earn_10 > high ~ "high",
+                                      TRUE ~ "med"))
+
+month_trends_df %>%
+  group_by(earnings_bracket) %>%
+  distinct(schname) %>%
+  count()
+
+mth_hi_lo_df <- filter(month_trends_df, earnings_bracket != "med")
+```
+
+### Data visualization
+
+Before conducting any modeling, we should observe the data and see if we can make
+any initial decisions about the appropriate analysis. We'll average over high/low
+earnings brackets to help chart the data better.
+
+```{r}
+exp_df <- full_hi_lo_df %>%
+  group_by(earnings_bracket, date) %>%
+  summarize(stand_index = mean(stand_index))
+
+ggplot(data = exp_df, aes(date, stand_index, colour = earnings_bracket)) +
+  geom_point() + 
+  geom_line()
+```
+
+```{r}
+mth_exp_df <- mth_hi_lo_df %>%
+  group_by(earnings_bracket, month) %>%
+  summarize(mth_index = mean(stand_index))
+
+ggplot(data = mth_exp_df, aes(month, mth_index, colour = earnings_bracket)) +
+  geom_point() + 
+  geom_line()
+```
+Based on these graphs, the weekly data looks like it captures the trends well,
+but there is a seasonal impact. What if we compare the difference between the index
+on a weekly basis?
+
+```{r}
+exp_df <- exp_df %>%
+  mutate(high = ifelse(earnings_bracket == 'high', stand_index, 0)) %>%
+  mutate(low = ifelse(earnings_bracket == 'low', stand_index, 0))
+
+diff_df <- exp_df %>%
+  group_by(date) %>%
+  summarize(diff = max(high) - max(low))
+
+ggplot(data = diff_df, aes(date, diff)) +
+  geom_point() + 
+  geom_line()
+```
+I think there's some more space to explore here, but I'm not seeing anything blatantly
+obvious, and we're moving into crunch time so I'll proceed with what I have on
+a weekly basis.
+
+### Actually the analysis
+
+Using the weekly data, we'll conduct a difference-in-differences analysis, treating
+the high earnings colleges as the treated sample and the low earnings colleges
+as the untreated sample. The reason we're using these "treated" classifications
+is because we're assuming the scorecard brings more attention to a high-income university.
+
+```{r}
+full_hi_lo_df <- full_hi_lo_df %>%
+  mutate(treated = earnings_bracket == "high") %>%
+  mutate(post_treatment = date >= as.Date("2015-09-01"))
+
+college_did <- feols(stand_index ~ treated * post_treatment, data = full_hi_lo_df)
+
+etable(college_did)
+```
+
+```{r}
+# same graph as before to look at the difference
+
+ggplot(exp_df, aes(x = date, y = stand_index, colour = earnings_bracket)) +
+  geom_line() +
+  geom_vline(xintercept = as.Date("2015-09-01"))
+```
+Let's also add fixed effects for month, since we see seasonal effects:
+
+```{r}
+college_did_adv <- feols(stand_index ~ treated * post_treatment | month, data = full_hi_lo_df)
+
+etable(college_did, college_did_adv)
+```
+
+## Conclusion
+
+In the first model, there is a downward trend in search term interest
+after the treatment date. Based on the standardization, for low-earning schools,
+there is a 5.2-standard-deviation decrease in search interest for those schools.
+However, high-earning schools have a positive influence of 3.9-standard-deviations.
+Both of these values are significant at the 0.05 level, but the difference post-
+treatment for high-earning schools is not significant.
+
+By adding "month" as a fixed effect, we find that the only significant factor is
+simply being a high-earning school. Independent of the treatment date, these
+schools saw an increase in search interest of 3.9 standard deviations.
+
+Based on this analysis, we would accept the null hypothesis that the scorecard
+had no impact on search interest between high- and low-earning schools, as
+defined in this study.
